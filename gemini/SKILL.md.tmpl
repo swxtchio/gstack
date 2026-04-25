@@ -1,0 +1,632 @@
+---
+name: gemini
+preamble-tier: 3
+version: 1.0.0
+description: |
+  Google Gemini CLI wrapper — three modes mirroring /codex.
+  Code review: independent diff review with pass/fail gate.
+  Challenge: adversarial mode that tries to break your code.
+  Consult: ask gemini anything with session continuity for follow-ups.
+  Architecturally divergent from Claude (different training paradigm), so
+  agreement = stronger signal and disagreement = better blind-spot coverage.
+  Use when asked to "gemini review", "gemini challenge", "ask gemini",
+  "second opinion", or "consult gemini". (gstack)
+voice-triggers:
+  - "ask gemini"
+  - "google second opinion"
+  - "gem in eye"
+triggers:
+  - gemini review
+  - gemini challenge
+  - ask gemini
+  - consult gemini
+  - second opinion gemini
+allowed-tools:
+  - Bash
+  - Read
+  - Write
+  - Glob
+  - Grep
+  - AskUserQuestion
+---
+
+{{PREAMBLE}}
+
+{{BASE_BRANCH_DETECT}}
+
+# /gemini — Google Gemini Second Opinion
+
+You are running the `/gemini` skill. This wraps the Google Gemini CLI to get an
+independent, brutally honest second opinion from a different AI system.
+
+Gemini is architecturally divergent from Claude (different training paradigm,
+multimodal-native from day one, MoE-based). When two models trained on different
+paradigms agree on a flaw, that's a much stronger signal than agreement between
+models that share similar transformer-decoder lineage. Present its output
+faithfully, not summarized.
+
+When `/codex` is also available, prefer running both for high-stakes reviews —
+three independent perspectives (Claude + Codex + Gemini) maximize blind-spot
+coverage. When only one outside voice can run, gemini is a strong default.
+
+---
+
+## Step 0: Check gemini binary
+
+```bash
+GEMINI_BIN=$(which gemini 2>/dev/null || echo "")
+[ -z "$GEMINI_BIN" ] && echo "NOT_FOUND" || echo "FOUND: $GEMINI_BIN"
+```
+
+If `NOT_FOUND`: stop and tell the user:
+"Gemini CLI not found. Install it: `npm install -g @google/gemini-cli` or see https://github.com/google-gemini/gemini-cli"
+
+If `NOT_FOUND`, also log the event:
+```bash
+_TEL=$(~/.claude/skills/gstack/bin/gstack-config get telemetry 2>/dev/null || echo off)
+source ~/.claude/skills/gstack/bin/gstack-gemini-probe 2>/dev/null && _gstack_gemini_log_event "gemini_cli_missing" 2>/dev/null || true
+```
+
+---
+
+## Step 0.5: Auth probe + version check
+
+Before building expensive prompts, verify Gemini has valid auth AND the installed
+CLI version isn't in the known-bad list. Sourcing `gstack-gemini-probe` loads
+the shared helpers.
+
+```bash
+_TEL=$(~/.claude/skills/gstack/bin/gstack-config get telemetry 2>/dev/null || echo off)
+source ~/.claude/skills/gstack/bin/gstack-gemini-probe
+
+if ! _gstack_gemini_auth_probe >/dev/null; then
+  _gstack_gemini_log_event "gemini_auth_failed"
+  echo "AUTH_FAILED"
+fi
+_gstack_gemini_version_check   # warns if known-bad, non-blocking
+```
+
+If the output contains `AUTH_FAILED`, stop and tell the user:
+"No Gemini authentication found. Run `gemini` interactively once to authenticate via your Google account, or set `$GEMINI_API_KEY`, then re-run this skill."
+
+If the version check printed a `WARN:` line, pass it through to the user verbatim
+(non-blocking — gemini may still work, but the user should upgrade).
+
+The probe accepts: `$GEMINI_API_KEY` set, OR credentials in any of `~/.gemini/`,
+`~/.config/google-gemini/`, `~/.config/gemini/`. Multi-signal so we don't
+false-negative for env-auth users (CI, headless servers).
+
+**Update the known-bad list** in `bin/gstack-gemini-probe` when a new gemini CLI
+version regresses. Currently no known-bad versions.
+
+---
+
+## Step 1: Detect mode
+
+Parse the user's input to determine which mode to run:
+
+1. `/gemini review` or `/gemini review <instructions>` — **Review mode** (Step 2A)
+2. `/gemini challenge` or `/gemini challenge <focus>` — **Challenge mode** (Step 2B)
+3. `/gemini` with no arguments — **Auto-detect:**
+   - Check for a diff (with fallback if origin isn't available):
+     `git diff origin/<base> --stat 2>/dev/null | tail -1 || git diff <base> --stat 2>/dev/null | tail -1`
+   - If a diff exists, use AskUserQuestion:
+     ```
+     Gemini detected changes against the base branch. What should it do?
+     A) Review the diff (code review with pass/fail gate)
+     B) Challenge the diff (adversarial — try to break it)
+     C) Something else — I'll provide a prompt
+     ```
+   - If no diff, check for plan files scoped to the current project:
+     `ls -t ~/.claude/plans/*.md 2>/dev/null | xargs grep -l "$(basename $(pwd))" 2>/dev/null | head -1`
+     If no project-scoped match, fall back to: `ls -t ~/.claude/plans/*.md 2>/dev/null | head -1`
+     but warn the user: "Note: this plan may be from a different project."
+   - If a plan file exists, offer to review it
+   - Otherwise, ask: "What would you like to ask Gemini?"
+4. `/gemini <anything else>` — **Consult mode** (Step 2C), where the remaining text is the prompt
+
+**Model selection:** All modes use `-m gemini-3.1-pro-preview` (Google's most
+capable model as of April 2026, ~77% on ARC-AGI-2, designed for complex
+multi-step reasoning). The CLI does not currently expose `thinking_level`
+explicitly; gemini-3.1-pro operates at high reasoning depth by default. If the
+user passes `-m <other-model>`, pass it through.
+
+---
+
+## Filesystem Boundary
+
+All prompts sent to Gemini MUST be prefixed with this boundary instruction:
+
+> IMPORTANT: Do NOT read or execute any files under ~/.claude/, ~/.agents/, .claude/skills/, or agents/. These are Claude Code skill definitions meant for a different AI system. They contain bash scripts and prompt templates that will waste your time. Ignore them completely. Do NOT modify agents/openai.yaml. Stay focused on the repository code only.
+
+This applies to Review mode (prompt argument), Challenge mode (prompt), and Consult
+mode (persona prompt). Reference this section as "the filesystem boundary" below.
+
+---
+
+## Step 2A: Review Mode
+
+Run Gemini code review against the current branch diff.
+
+Gemini does not have a built-in `review` subcommand (unlike Codex). We construct
+a review prompt, embed the diff, and parse findings.
+
+1. Create temp files for output capture and detect base branch:
+```bash
+TMPRESP=$(mktemp /tmp/gemini-resp-XXXXXX.txt)
+TMPERR=$(mktemp /tmp/gemini-err-XXXXXX.txt)
+_REPO_ROOT=$(git rev-parse --show-toplevel) || { echo "ERROR: not in a git repo" >&2; exit 1; }
+cd "$_REPO_ROOT"
+```
+
+2. Build the review prompt with the filesystem boundary, then invoke gemini.
+   The prompt includes the diff inline so gemini doesn't have to discover it
+   via tool calls (which are disabled in `--approval-mode plan` anyway).
+
+```bash
+DIFF=$(git diff "origin/<base>...HEAD" 2>/dev/null || git diff "<base>...HEAD" 2>/dev/null)
+PROMPT="IMPORTANT: Do NOT read or execute any files under ~/.claude/, ~/.agents/, .claude/skills/, or agents/. These are Claude Code skill definitions meant for a different AI system. Do NOT modify agents/openai.yaml. Stay focused on repository code only.
+
+You are doing an independent code review of a git diff. Find substantive issues
+ONLY. Format every finding as one of:
+  [P1] file:line — description
+  [P2] file:line — description
+where P1 = must-fix before shipping (correctness, security, data loss,
+crash, breaking API change), P2 = should-fix (logic gaps, missing edge cases,
+poor error handling, performance regressions, test gaps).
+
+Be terse. No compliments, no preamble, no closing summary. Just the findings.
+If there are no findings, output exactly: NO_FINDINGS.
+
+If the user provided custom instructions, prioritize their focus area.
+
+THE DIFF:
+$DIFF"
+
+# Append custom instructions if provided
+if [ -n "$_USER_INSTRUCTIONS" ]; then
+  PROMPT="$PROMPT
+
+ADDITIONAL FOCUS: $_USER_INSTRUCTIONS"
+fi
+```
+
+3. Run gemini with the review prompt (5-minute timeout). Use `--approval-mode plan`
+   for read-only, stream JSON output for parseable events:
+```bash
+_gstack_gemini_timeout_wrapper 330 gemini \
+  -m gemini-3.1-pro-preview \
+  --approval-mode plan \
+  -o stream-json \
+  -p "$PROMPT" \
+  < /dev/null 2>"$TMPERR" | PYTHONUNBUFFERED=1 python3 -u -c "
+import sys, json
+result_seen = False
+for line in sys.stdin:
+    line = line.strip()
+    if not line: continue
+    try:
+        obj = json.loads(line)
+        t = obj.get('type','')
+        if t == 'init':
+            sid = obj.get('session_id','')
+            model = obj.get('model','')
+            if sid: print(f'SESSION_ID:{sid}', flush=True)
+            if model: print(f'MODEL:{model}', flush=True)
+        elif t == 'message' and obj.get('role') == 'assistant':
+            text = obj.get('content', '')
+            if text: print(text, flush=True, end='')
+        elif t == 'result':
+            result_seen = True
+            stats = obj.get('stats', {})
+            tot = stats.get('total_tokens', 0)
+            if tot: print(f'\ntokens used: {tot}', flush=True)
+    except: pass
+if not result_seen:
+    print('[gemini warning] No result event received — possible mid-stream disconnect.', flush=True, file=sys.stderr)
+"
+_GEMINI_EXIT=${PIPESTATUS[0]}
+if [ "$_GEMINI_EXIT" = "124" ]; then
+  _gstack_gemini_log_event "gemini_timeout" "330"
+  _gstack_gemini_log_hang "review" "$(wc -c < "$TMPERR" 2>/dev/null || echo 0)"
+  echo "Gemini stalled past 5.5 minutes. Common causes: model API stall, large diff, network issue. Try re-running with a smaller scope. Check ~/.gemini/logs/ if persistent."
+fi
+if grep -qiE "auth|login|sign in|unauthorized" "$TMPERR" 2>/dev/null; then
+  echo "[gemini auth error] $(head -1 "$TMPERR")"
+  _gstack_gemini_log_event "gemini_auth_failed"
+fi
+```
+
+Use `timeout: 300000` on the Bash call.
+
+4. Parse the response for cost (already streamed via `tokens used: N`).
+
+5. Determine gate verdict by checking the review output for critical findings.
+   If the output contains `[P1]` — the gate is **FAIL**.
+   If no `[P1]` markers are found (only `[P2]` or `NO_FINDINGS`) — the gate is **PASS**.
+
+6. Present the output:
+
+```
+GEMINI SAYS (code review — gemini-3.1-pro-preview):
+════════════════════════════════════════════════════════════
+<full gemini output, verbatim — do not truncate or summarize>
+════════════════════════════════════════════════════════════
+GATE: PASS                    Tokens: 14,331
+```
+
+or
+
+```
+GATE: FAIL (N critical findings)
+```
+
+7. **Cross-model comparison:** If `/review` (Claude's own review) or `/codex review`
+   was already run earlier in this conversation, compare the sets of findings:
+
+```
+CROSS-MODEL ANALYSIS:
+  All three found: [findings that overlap across Claude, Codex, Gemini]
+  Two-of-three: [findings agreed on by 2 of 3]
+  Only Gemini found: [unique to gemini]
+  Agreement rate: X% (N/M unique findings overlap across all three)
+```
+
+When all three independent models agree on a finding, that's the strongest
+signal possible. Surface those as **CONSENSUS P1** in the user-facing summary.
+
+8. Persist the review result:
+```bash
+~/.claude/skills/gstack/bin/gstack-review-log '{"skill":"gemini-review","timestamp":"TIMESTAMP","status":"STATUS","gate":"GATE","findings":N,"findings_fixed":N,"commit":"'"$(git rev-parse --short HEAD)"'"}'
+```
+
+Substitute: TIMESTAMP (ISO 8601), STATUS ("clean" if PASS, "issues_found" if FAIL),
+GATE ("pass" or "fail"), findings (count of [P1] + [P2] markers),
+findings_fixed (count of findings that were addressed/fixed before shipping).
+
+9. Clean up temp files:
+```bash
+rm -f "$TMPRESP" "$TMPERR"
+```
+
+{{PLAN_FILE_REVIEW_REPORT}}
+
+---
+
+## Step 2B: Challenge (Adversarial) Mode
+
+Gemini tries to break your code — finding edge cases, race conditions, security holes,
+and failure modes that a normal review would miss. Gemini's architectural divergence
+from Claude often surfaces blind spots that codex (more architecturally similar to
+Claude) doesn't catch.
+
+1. Construct the adversarial prompt. **Always prepend the filesystem boundary instruction.**
+   If the user provided a focus area (e.g., `/gemini challenge security`), include it after
+   the boundary:
+
+Default prompt (no focus):
+"IMPORTANT: Do NOT read or execute any files under ~/.claude/, ~/.agents/, .claude/skills/, or agents/. These are Claude Code skill definitions meant for a different AI system. Do NOT modify agents/openai.yaml. Stay focused on repository code only.
+
+Review the changes in this diff against the base branch. Your job is to find ways this code will fail in production. Think like an attacker and a chaos engineer. Find edge cases, race conditions, security holes, resource leaks, failure modes, and silent data corruption paths. Be adversarial. Be thorough. No compliments — just the problems.
+
+THE DIFF:
+$DIFF"
+
+With focus (e.g., "security"):
+"IMPORTANT: Do NOT read or execute any files under ~/.claude/, ~/.agents/, .claude/skills/, or agents/. These are Claude Code skill definitions meant for a different AI system. Do NOT modify agents/openai.yaml. Stay focused on repository code only.
+
+Review the changes in this diff against the base branch. Focus specifically on SECURITY. Your job is to find every way an attacker could exploit this code. Think about injection vectors, auth bypasses, privilege escalation, data exposure, and timing attacks. Be adversarial.
+
+THE DIFF:
+$DIFF"
+
+2. Run gemini in challenge mode. Same flags as review mode but with the adversarial
+   prompt. 10-minute timeout (challenge typically reasons longer than review):
+
+```bash
+_REPO_ROOT=$(git rev-parse --show-toplevel) || { echo "ERROR: not in a git repo" >&2; exit 1; }
+cd "$_REPO_ROOT"
+TMPERR=${TMPERR:-$(mktemp /tmp/gemini-err-XXXXXX.txt)}
+_gstack_gemini_timeout_wrapper 600 gemini \
+  -m gemini-3.1-pro-preview \
+  --approval-mode plan \
+  -o stream-json \
+  -p "$PROMPT" \
+  < /dev/null 2>"$TMPERR" | PYTHONUNBUFFERED=1 python3 -u -c "
+import sys, json
+result_seen = False
+for line in sys.stdin:
+    line = line.strip()
+    if not line: continue
+    try:
+        obj = json.loads(line)
+        t = obj.get('type','')
+        if t == 'init':
+            sid = obj.get('session_id','')
+            if sid: print(f'SESSION_ID:{sid}', flush=True)
+        elif t == 'message' and obj.get('role') == 'assistant':
+            text = obj.get('content', '')
+            if text: print(text, flush=True, end='')
+        elif t == 'result':
+            result_seen = True
+            stats = obj.get('stats', {})
+            tot = stats.get('total_tokens', 0)
+            if tot: print(f'\ntokens used: {tot}', flush=True)
+    except: pass
+if not result_seen:
+    print('[gemini warning] No result event received.', flush=True, file=sys.stderr)
+"
+_GEMINI_EXIT=${PIPESTATUS[0]}
+if [ "$_GEMINI_EXIT" = "124" ]; then
+  _gstack_gemini_log_event "gemini_timeout" "600"
+  _gstack_gemini_log_hang "challenge" "$(wc -c < "$TMPERR" 2>/dev/null || echo 0)"
+  echo "Gemini stalled past 10 minutes. Common causes: model API stall, large diff, network issue."
+fi
+if grep -qiE "auth|login|sign in|unauthorized" "$TMPERR" 2>/dev/null; then
+  echo "[gemini auth error] $(head -1 "$TMPERR")"
+  _gstack_gemini_log_event "gemini_auth_failed"
+fi
+```
+
+3. Present the full streamed output:
+
+```
+GEMINI SAYS (adversarial challenge — gemini-3.1-pro-preview):
+════════════════════════════════════════════════════════════
+<full output from above, verbatim>
+════════════════════════════════════════════════════════════
+Tokens: N
+```
+
+---
+
+## Step 2C: Consult Mode
+
+Ask Gemini anything about the codebase. Supports session continuity for follow-ups
+via gemini's `--resume` flag (which uses numeric index or "latest" — different from
+codex's thread-id model).
+
+1. **Check for existing session:** Gemini stores sessions per-project (CWD-aware).
+   List recent sessions:
+```bash
+gemini --list-sessions 2>&1 | head -5
+```
+
+If sessions exist, use AskUserQuestion:
+```
+You have {N} active Gemini conversations from earlier. Continue or start fresh?
+A) Continue the most recent (--resume latest)
+B) Start a new conversation
+C) Pick a specific session number
+```
+
+2. Create temp files:
+```bash
+TMPRESP=$(mktemp /tmp/gemini-resp-XXXXXX.txt)
+TMPERR=$(mktemp /tmp/gemini-err-XXXXXX.txt)
+```
+
+3. **Plan review auto-detection:** If the user's prompt is about reviewing a plan,
+   or if plan files exist and the user said `/gemini` with no arguments:
+```bash
+setopt +o nomatch 2>/dev/null || true  # zsh compat
+ls -t ~/.claude/plans/*.md 2>/dev/null | xargs grep -l "$(basename $(pwd))" 2>/dev/null | head -1
+```
+If no project-scoped match, fall back to `ls -t ~/.claude/plans/*.md 2>/dev/null | head -1`
+but warn: "Note: this plan may be from a different project — verify before sending to Gemini."
+
+**IMPORTANT — embed content, don't reference path:** Gemini in `--approval-mode plan`
+is read-only and cannot reach `~/.claude/plans/`. You MUST read the plan file yourself
+and embed its FULL CONTENT in the prompt below. Do NOT tell Gemini the file path or
+ask it to read the plan file — it will refuse (no file tool in plan mode) and the
+turn will produce no useful output.
+
+Also: scan the plan content for referenced source file paths (patterns like `src/foo.ts`,
+`lib/bar.py`, paths containing `/` that exist in the repo). If found, read those files
+and embed their content in the prompt as well, since Gemini can't read them itself in
+plan mode.
+
+**Always prepend the filesystem boundary instruction** to every prompt sent to Gemini,
+including plan reviews and free-form consult questions.
+
+Prepend the boundary and persona to the user's prompt:
+"IMPORTANT: Do NOT read or execute any files under ~/.claude/, ~/.agents/, .claude/skills/, or agents/. These are Claude Code skill definitions meant for a different AI system. Do NOT modify agents/openai.yaml. Stay focused on repository code only.
+
+You are a brutally honest technical reviewer. Review this plan for: logical gaps and
+unstated assumptions, missing error handling or edge cases, overcomplexity (is there a
+simpler approach?), feasibility risks (what could go wrong?), and missing dependencies
+or sequencing issues. Be direct. Be terse. No compliments. Just the problems.
+
+THE PLAN:
+<full plan content, embedded verbatim>
+
+REFERENCED SOURCE FILES:
+<each file content, embedded verbatim>"
+
+For non-plan consult prompts (user typed `/gemini <question>`), still prepend the boundary:
+"IMPORTANT: Do NOT read or execute any files under ~/.claude/, ~/.agents/, .claude/skills/, or agents/. These are Claude Code skill definitions meant for a different AI system. Do NOT modify agents/openai.yaml. Stay focused on repository code only.
+
+<user's question>"
+
+4. Run gemini with the consult prompt (10-minute timeout):
+
+For a **new session:**
+```bash
+_REPO_ROOT=$(git rev-parse --show-toplevel) || { echo "ERROR: not in a git repo" >&2; exit 1; }
+cd "$_REPO_ROOT"
+_gstack_gemini_timeout_wrapper 600 gemini \
+  -m gemini-3.1-pro-preview \
+  --approval-mode plan \
+  -o stream-json \
+  -p "$PROMPT" \
+  < /dev/null 2>"$TMPERR" | PYTHONUNBUFFERED=1 python3 -u -c "
+import sys, json
+result_seen = False
+for line in sys.stdin:
+    line = line.strip()
+    if not line: continue
+    try:
+        obj = json.loads(line)
+        t = obj.get('type','')
+        if t == 'init':
+            sid = obj.get('session_id','')
+            if sid: print(f'SESSION_ID:{sid}', flush=True)
+        elif t == 'message' and obj.get('role') == 'assistant':
+            text = obj.get('content', '')
+            if text: print(text, flush=True, end='')
+        elif t == 'result':
+            result_seen = True
+            stats = obj.get('stats', {})
+            tot = stats.get('total_tokens', 0)
+            if tot: print(f'\ntokens used: {tot}', flush=True)
+    except: pass
+if not result_seen:
+    print('[gemini warning] No result event received.', flush=True, file=sys.stderr)
+"
+_GEMINI_EXIT=${PIPESTATUS[0]}
+if [ "$_GEMINI_EXIT" = "124" ]; then
+  _gstack_gemini_log_event "gemini_timeout" "600"
+  _gstack_gemini_log_hang "consult" "$(wc -c < "$TMPERR" 2>/dev/null || echo 0)"
+  echo "Gemini stalled past 10 minutes. Try a smaller scope or check ~/.gemini/logs/."
+fi
+```
+
+For a **resumed session** (user chose "Continue"):
+```bash
+_REPO_ROOT=$(git rev-parse --show-toplevel) || { echo "ERROR: not in a git repo" >&2; exit 1; }
+cd "$_REPO_ROOT"
+_gstack_gemini_timeout_wrapper 600 gemini \
+  -m gemini-3.1-pro-preview \
+  --approval-mode plan \
+  --resume latest \
+  -o stream-json \
+  -p "$PROMPT" \
+  < /dev/null 2>"$TMPERR" | PYTHONUNBUFFERED=1 python3 -u -c "
+<same python streaming parser as above>
+"
+_GEMINI_EXIT=${PIPESTATUS[0]}
+if [ "$_GEMINI_EXIT" = "124" ]; then
+  _gstack_gemini_log_event "gemini_timeout" "600"
+  _gstack_gemini_log_hang "consult-resume" "$(wc -c < "$TMPERR" 2>/dev/null || echo 0)"
+  echo "Gemini stalled past 10 minutes."
+fi
+```
+
+5. Capture session ID from the streamed `init` event. The parser prints
+   `SESSION_ID:<uuid>`. Save it for follow-ups (gemini's session resume uses
+   numeric index, but the UUID is useful for diagnostic / log correlation):
+```bash
+mkdir -p .context
+```
+Save the session ID printed by the parser to `.context/gemini-session-id`.
+
+6. Present the full streamed output:
+
+```
+GEMINI SAYS (consult — gemini-3.1-pro-preview):
+════════════════════════════════════════════════════════════
+<full output, verbatim>
+════════════════════════════════════════════════════════════
+Tokens: N
+Session saved — run /gemini again to continue this conversation.
+```
+
+7. After presenting, note any points where Gemini's analysis differs from your own
+   understanding. If there is a disagreement, flag it:
+   "Note: Claude Code disagrees on X because Y."
+
+---
+
+## Model & Reasoning
+
+**Model:** Default is `gemini-3.1-pro-preview` (Google's most capable model as of
+April 2026). Pinned via `-m gemini-3.1-pro-preview` on every invocation. This
+preference matches the user's stated requirement of "highest effort on best model."
+
+If gemini ships a more capable model later (e.g., `gemini-3.2-pro` or `gemini-4-pro`),
+update this skill to pin the new default. Do not auto-detect; explicit pinning
+prevents silent model shifts.
+
+If the user passes `-m <other-model>` (e.g., `/gemini consult -m gemini-3.1-flash`),
+pass it through. Common variants:
+- `gemini-3.1-pro-preview` — highest reasoning, slowest, most expensive (default)
+- `gemini-3.1-flash` — faster, cheaper, lower reasoning depth
+- `gemini-3.1-flash-lite` — fastest, minimum reasoning
+
+**Reasoning effort:** Gemini's `thinking_level` parameter (minimal / low / medium / high)
+is exposed via the API but not currently exposed by the gemini CLI v0.38.x as a flag.
+Gemini-3.1-pro operates at high reasoning by default, which matches "highest effort"
+for our purposes. If/when the CLI exposes `--thinking-level` (tracked in
+google-gemini/gemini-cli#21974, #25122), update this skill to pass `--thinking-level=high`
+explicitly.
+
+**Approval mode:** All `/gemini` invocations use `--approval-mode plan` (read-only).
+Gemini cannot modify files or execute shell commands. This is the equivalent of
+`codex -s read-only`.
+
+**Web search:** Gemini's web-search tool is gated by approval mode. In `plan` mode,
+it's not available. Gemini relies on its training-time knowledge instead. If the
+user explicitly needs web search for a consult, document the limitation and suggest
+they run gemini interactively (without this skill) for that specific question.
+
+---
+
+## Cost Estimation
+
+Parse token count from the `result` event's `stats.total_tokens` field
+(streamed by the python parser as `tokens used: N`).
+
+Display as: `Tokens: N`
+
+If token count is not available, display: `Tokens: unknown`
+
+Note: Gemini CLI does not currently print per-call cost in USD. For cost
+tracking, consult Google's billing dashboard (Vertex AI usage page) or set
+up a periodic billing query.
+
+---
+
+## Error Handling
+
+- **Binary not found:** Detected in Step 0. Stop with install instructions.
+- **Auth error:** Probe in Step 0.5 returns AUTH_FAILED. Stop and tell the user:
+  "Gemini authentication failed. Run `gemini` interactively to log in via Google OAuth, or set `$GEMINI_API_KEY`."
+- **Timeout (Bash outer gate):** If the Bash call times out (5.5 min for Review,
+  10 min for Challenge/Consult), tell the user:
+  "Gemini timed out. The diff/prompt may be too large or the API may be slow.
+  Try again with a smaller scope."
+- **Timeout (inner `timeout` wrapper, exit 124):** The skill's hang-detection
+  block auto-logs a telemetry event and prints an actionable message. No extra
+  action needed.
+- **Empty response:** If the parser never sees a `result` event, surface:
+  "Gemini returned no result event. Check stderr for errors: $TMPERR"
+- **`--approval-mode plan` blocks tool use:** If gemini's response indicates it
+  needed to read a file or run a command but couldn't, the prompt was
+  under-specified — embed more context next time.
+- **Session resume failure:** If `--resume latest` fails (no prior session in this
+  project), fall through to a new-session call.
+
+---
+
+## Important Rules
+
+- **Never modify files.** This skill is read-only. Gemini runs in `--approval-mode plan`.
+- **Always pin the model.** Pass `-m gemini-3.1-pro-preview` on every invocation
+  unless the user explicitly overrides with `-m <other>`.
+- **Present output verbatim.** Do not truncate, summarize, or editorialize Gemini's
+  output before showing it. Show it in full inside the GEMINI SAYS block.
+- **Add synthesis after, not instead of.** Any Claude commentary comes after the
+  full output.
+- **5.5-minute timeout** for Review, **10-minute timeout** for Challenge/Consult
+  (`timeout: 300000` and `timeout: 600000` respectively on the Bash call).
+- **Embed content, don't reference paths.** Gemini in plan mode can't read files
+  outside CWD via tools. Always inline the diff, plan, or referenced source files.
+- **Detect skill-file rabbit holes.** After receiving Gemini output, scan for signs
+  that Gemini got distracted by skill files: `gstack-config`, `gstack-update-check`,
+  `SKILL.md`, or `skills/gstack`. If any of these appear in the output, append a
+  warning: "Gemini appears to have read gstack skill files instead of reviewing your
+  code. Consider retrying."
+- **Triangulate.** When `/codex` and `/review` (Claude self-review) are also
+  available, prefer running all three for high-stakes reviews. Three-way agreement
+  on a finding is the strongest possible signal; disagreement points at blind spots
+  worth investigating.

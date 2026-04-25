@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# gstack-gemini-probe: shared helper for /gemini and outside-voice skills.
+# Sourced from template bash blocks; never execute directly.
+#
+# Functions (all prefixed with _gstack_gemini_ for namespace hygiene):
+#   _gstack_gemini_auth_probe      — auth check (login state + ~/.gemini/ files)
+#   _gstack_gemini_version_check   — warn on known-bad gemini CLI versions
+#   _gstack_gemini_timeout_wrapper — gtimeout -> timeout -> unwrapped fallback
+#   _gstack_gemini_log_event       — telemetry emission to ~/.gstack/analytics/
+#
+# Hygiene rules (mirror gstack-codex-probe):
+#   - Never set -e / set -u / trap / IFS= / PATH= in this file.
+#   - All internal vars prefix with _GSTACK_GEMINI_.
+#   - All functions prefix with _gstack_gemini_.
+#   - No command execution at source time (only function defs).
+
+# --- Auth probe -------------------------------------------------------------
+
+_gstack_gemini_auth_probe() {
+  # Gemini CLI authenticates via Google OAuth (interactive browser flow on
+  # first run) and stores tokens under one of:
+  #   ~/.gemini/                     (newer CLI default)
+  #   ~/.config/google-gemini/       (alternate location)
+  #   ~/.config/gemini/              (older alternate)
+  # Or via env var GEMINI_API_KEY for headless / CI use.
+  #
+  # We probe in order: env var, then any of the credential file locations.
+  # Multi-signal so we don't false-negative for users authenticated via env.
+  local _k1
+  _k1=$(printf '%s' "${GEMINI_API_KEY:-}" | tr -d '[:space:]')
+  if [ -n "$_k1" ]; then
+    echo "AUTH_OK"
+    return 0
+  fi
+  if [ -d "$HOME/.gemini" ] && [ -n "$(ls -A "$HOME/.gemini" 2>/dev/null)" ]; then
+    echo "AUTH_OK"
+    return 0
+  fi
+  if [ -d "$HOME/.config/google-gemini" ] && [ -n "$(ls -A "$HOME/.config/google-gemini" 2>/dev/null)" ]; then
+    echo "AUTH_OK"
+    return 0
+  fi
+  if [ -d "$HOME/.config/gemini" ] && [ -n "$(ls -A "$HOME/.config/gemini" 2>/dev/null)" ]; then
+    echo "AUTH_OK"
+    return 0
+  fi
+  echo "AUTH_FAILED"
+  return 1
+}
+
+# --- Version check ----------------------------------------------------------
+
+_gstack_gemini_version_check() {
+  # Warn on known-bad gemini CLI versions. Anchored regex prevents false
+  # positives. Update this list when a new gemini CLI version regresses.
+  #
+  # Currently no known-bad releases; entries should be added when issues
+  # are discovered (e.g., stdin deadlocks, auth regressions, breaking
+  # output-format changes).
+  local _ver
+  _ver=$(gemini --version 2>/dev/null | head -1)
+  [ -z "$_ver" ] && return 0
+  # Example pattern (commented out — fill in when needed):
+  # if echo "$_ver" | grep -Eq '(^|[^0-9.])0\.38\.(0)([^0-9.]|$)'; then
+  #   echo "WARN: gemini CLI $_ver has known issues. Upgrade: npm install -g @google/gemini-cli@latest"
+  #   _gstack_gemini_log_event "gemini_version_warning"
+  # fi
+  return 0
+}
+
+# --- Timeout wrapper --------------------------------------------------------
+
+_gstack_gemini_timeout_wrapper() {
+  # Resolve wrapper binary: prefer gtimeout (Homebrew coreutils on macOS),
+  # fall back to timeout (Linux), else run unwrapped. Arguments: $1 is the
+  # duration in seconds; rest is the command to run.
+  local _duration="$1"
+  shift
+  local _to
+  _to=$(command -v gtimeout 2>/dev/null || command -v timeout 2>/dev/null || echo "")
+  if [ -n "$_to" ]; then
+    "$_to" "$_duration" "$@"
+  else
+    "$@"
+  fi
+}
+
+# --- Telemetry event --------------------------------------------------------
+
+_gstack_gemini_log_event() {
+  # Emit a telemetry event to ~/.gstack/analytics/skill-usage.jsonl.
+  # Gated on $_TEL != "off" (caller sets this from gstack-config).
+  # Event types: gemini_timeout, gemini_auth_failed, gemini_cli_missing,
+  #              gemini_version_warning.
+  # Payload schema: {skill, event, duration_s, ts}. NEVER includes prompt
+  # content, env var values, or auth tokens.
+  local _event="$1"
+  local _duration="${2:-0}"
+  [ "${_TEL:-off}" = "off" ] && return 0
+  local _ts
+  _ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  mkdir -p "$HOME/.gstack/analytics" 2>/dev/null
+  printf '{"skill":"gemini","event":"%s","duration_s":"%s","ts":"%s"}\n' \
+    "$_event" "$_duration" "$_ts" \
+    >> "$HOME/.gstack/analytics/skill-usage.jsonl" 2>/dev/null || true
+}
+
+# --- Hang detection helper --------------------------------------------------
+
+_gstack_gemini_log_hang() {
+  # Called when timeout fires. Emits a structured event for postmortem.
+  local _mode="$1"          # review | challenge | consult
+  local _stderr_bytes="$2"  # bytes captured before timeout
+  _gstack_gemini_log_event "gemini_hang_${_mode}" "$_stderr_bytes"
+}
