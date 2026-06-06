@@ -1,0 +1,248 @@
+#!/usr/bin/env bash
+#
+# gstack-safe-update — upgrade gstack without destroying your customizations.
+#
+# Why this exists:
+#   /gstack-upgrade runs `git reset --hard origin/main` on the CURRENTLY CHECKED-OUT
+#   branch. If you're sitting on your customization branch (e.g. `swxtch`), that hard
+#   reset silently discards your commits. This script instead:
+#     1. keeps `main` as a pure mirror of upstream (the branch that gets reset),
+#     2. fast-forwards/resets `main` to origin/main,
+#     3. runs ./setup + version migrations (same as the upgrade skill),
+#     4. rebases your customization branch on top of the new `main`.
+#
+# Your work on `$CUSTOM_BRANCH` is replayed via rebase, never reset away.
+#
+# Usage:
+#   gstack-safe-update [--dry-run] [--check] [custom_branch]
+#
+# Env overrides:
+#   GSTACK_DIR        install dir          (default: ~/.claude/skills/gstack)
+#   GSTACK_TRACK      upstream mirror branch (default: main)
+#   GSTACK_CUSTOM     customization branch   (default: swxtch, or $1)
+#   GSTACK_REMOTE     upstream remote        (default: origin)
+#   GSTACK_LINK       PATH symlink to maintain (default: ~/.local/bin/gstack-safe-update;
+#                     set empty to disable the self-link)
+#
+# Self-survival:
+#   This script is TRACKED on the customization branch only. When it checks out
+#   `main` (where the file does not exist) git removes it from the working tree —
+#   which would corrupt a still-running bash process reading from that path. So the
+#   first thing we do is re-exec from a private temp copy; from then on the running
+#   image is independent of any branch switch the script performs. The temp copy
+#   deletes itself on exit.
+if [ -z "${_GSU_REEXEC:-}" ]; then
+  _gsu_self="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")"
+  _gsu_tmp="$(mktemp "${TMPDIR:-/tmp}/gstack-safe-update.XXXXXX")"
+  cat "$_gsu_self" > "$_gsu_tmp"
+  chmod +x "$_gsu_tmp"
+  export _GSU_REEXEC=1
+  exec bash "$_gsu_tmp" "$@"
+fi
+trap 'rm -f -- "$0"' EXIT   # $0 is the temp copy under re-exec — clean it up
+
+set -euo pipefail
+
+# ---- config -----------------------------------------------------------------
+INSTALL_DIR="${GSTACK_DIR:-$HOME/.claude/skills/gstack}"
+TRACK_BRANCH="${GSTACK_TRACK:-main}"
+REMOTE="${GSTACK_REMOTE:-origin}"
+LINK_PATH="${GSTACK_LINK:-$HOME/.local/bin/gstack-safe-update}"
+
+DRY_RUN=0
+CHECK_ONLY=0
+CUSTOM_ARG=""
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run) DRY_RUN=1 ;;
+    --check)   CHECK_ONLY=1 ;;
+    -h|--help) sed -n '2,40p' "$0"; exit 0 ;;
+    -*) echo "unknown flag: $arg" >&2; exit 2 ;;
+    *)  CUSTOM_ARG="$arg" ;;
+  esac
+done
+CUSTOM_BRANCH="${GSTACK_CUSTOM:-${CUSTOM_ARG:-swxtch}}"
+
+# ---- helpers ----------------------------------------------------------------
+say()  { printf '\033[1;36m▸ %s\033[0m\n' "$*"; }
+ok()   { printf '\033[1;32m✓ %s\033[0m\n' "$*"; }
+warn() { printf '\033[1;33m! %s\033[0m\n' "$*"; }
+die()  { printf '\033[1;31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
+run()  { if [ "$DRY_RUN" = 1 ]; then echo "  [dry-run] $*"; else eval "$@"; fi; }
+
+# Idempotently point $LINK_PATH at the in-repo canonical script. A symlink (not a
+# copy) means the PATH entry always tracks the committed branch version. Safe to
+# run every invocation: no-ops once correct, repoints a stale/foreign symlink, and
+# refuses to clobber a non-symlink it didn't create.
+ensure_symlink() {
+  [ -n "$LINK_PATH" ] || return 0                      # disabled via empty GSTACK_LINK
+  local canonical="$INSTALL_DIR/scripts/gstack-safe-update"
+  if [ -L "$LINK_PATH" ] && [ "$(readlink "$LINK_PATH")" = "$canonical" ]; then
+    return 0                                            # already correct — nothing to do
+  fi
+  if [ "$DRY_RUN" = 1 ]; then
+    echo "  [dry-run] ln -sfn '$canonical' '$LINK_PATH'"
+    return 0
+  fi
+  if [ -e "$LINK_PATH" ] && [ ! -L "$LINK_PATH" ]; then
+    # a real file lives there — only replace one we clearly authored
+    if ! grep -q 'gstack-safe-update — upgrade gstack' "$LINK_PATH" 2>/dev/null; then
+      warn "$LINK_PATH exists and isn't ours — leaving it alone (set GSTACK_LINK to relocate)"
+      return 0
+    fi
+  fi
+  mkdir -p "$(dirname "$LINK_PATH")" 2>/dev/null \
+    || { warn "cannot create $(dirname "$LINK_PATH") — skipping self-link"; return 0; }
+  if ln -sfn "$canonical" "$LINK_PATH" 2>/dev/null; then
+    say "Linked $LINK_PATH → scripts/gstack-safe-update"
+  else
+    warn "could not create symlink at $LINK_PATH"
+  fi
+}
+
+# ---- preflight --------------------------------------------------------------
+[ -d "$INSTALL_DIR/.git" ] || die "no git install at $INSTALL_DIR (set GSTACK_DIR)"
+cd "$INSTALL_DIR"
+INSTALL_DIR="$PWD"   # normalize to absolute so the symlink target is stable
+
+# refuse to run mid-rebase/merge
+if [ -d .git/rebase-merge ] || [ -d .git/rebase-apply ] || [ -f .git/MERGE_HEAD ]; then
+  die "a rebase/merge is already in progress in $INSTALL_DIR — resolve it first"
+fi
+
+git show-ref --verify --quiet "refs/heads/$TRACK_BRANCH" \
+  || die "tracking branch '$TRACK_BRANCH' does not exist"
+
+ORIG_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+OLD_VERSION="$(cat VERSION 2>/dev/null || echo unknown)"
+
+say "Install:   $INSTALL_DIR"
+say "Version:   $OLD_VERSION"
+say "Branches:  track=$TRACK_BRANCH  custom=$CUSTOM_BRANCH  (currently on $ORIG_BRANCH)"
+
+# self-bootstrap the PATH symlink (before any checkout; harmless if file is
+# transiently absent on `main` — a symlink target need not exist at create time)
+ensure_symlink
+
+# ---- fetch + report what's upstream ----------------------------------------
+say "Fetching $REMOTE…"
+git fetch --quiet "$REMOTE"
+
+UPSTREAM="$REMOTE/$TRACK_BRANCH"
+git show-ref --verify --quiet "refs/remotes/$UPSTREAM" \
+  || die "$UPSTREAM not found after fetch"
+
+BEHIND="$(git rev-list --count "$TRACK_BRANCH..$UPSTREAM")"   # commits upstream has, $TRACK_BRANCH lacks
+AHEAD="$(git rev-list --count "$UPSTREAM..$TRACK_BRANCH")"    # local-only commits on $TRACK_BRANCH
+
+if [ "$AHEAD" != 0 ]; then
+  die "$TRACK_BRANCH has $AHEAD local commit(s) not in $UPSTREAM.
+   '$TRACK_BRANCH' is meant to mirror upstream and gets hard-reset.
+   Move those commits to '$CUSTOM_BRANCH' first, then re-run."
+fi
+
+if [ "$BEHIND" = 0 ]; then
+  ok "Already up to date with $UPSTREAM (v$OLD_VERSION)."
+  # still offer to rebase custom branch if it has drifted off main
+else
+  say "$BEHIND new upstream commit(s) available:"
+  git --no-pager log --oneline "$TRACK_BRANCH..$UPSTREAM" | sed 's/^/    /'
+fi
+
+if [ "$CHECK_ONLY" = 1 ]; then
+  exit 0
+fi
+
+# ---- stash dirty working tree ----------------------------------------------
+STASHED=0
+if ! git diff --quiet || ! git diff --cached --quiet; then
+  warn "Working tree is dirty — stashing before update."
+  run "git stash push -u -m 'gstack-safe-update auto-stash'"
+  STASHED=1
+fi
+
+restore_stash() {
+  if [ "$STASHED" = 1 ]; then
+    say "Restoring stashed changes…"
+    git stash pop || warn "stash pop hit conflicts — resolve manually (see: git stash list)"
+  fi
+}
+
+# ---- update the mirror branch ----------------------------------------------
+if [ "$BEHIND" != 0 ]; then
+  say "Updating $TRACK_BRANCH → $UPSTREAM…"
+  run "git checkout --quiet $TRACK_BRANCH"
+  run "git merge --ff-only $UPSTREAM"   # safe: we proved AHEAD=0, so FF always works
+  ok "$TRACK_BRANCH now at $(git rev-parse --short "$UPSTREAM")"
+
+  # ---- ./setup ----
+  if [ -x ./setup ]; then
+    say "Running ./setup…"
+    run "./setup"
+  else
+    warn "no executable ./setup found — skipping"
+  fi
+
+  # ---- version migrations (mirrors gstack-upgrade Step 4.75) ----
+  MIG_DIR="$INSTALL_DIR/gstack-upgrade/migrations"
+  if [ -d "$MIG_DIR" ] && [ "$OLD_VERSION" != unknown ]; then
+    for migration in $(find "$MIG_DIR" -maxdepth 1 -name 'v*.sh' -type f 2>/dev/null | sort -V); do
+      m_ver="$(basename "$migration" .sh | sed 's/^v//')"
+      # run only migrations strictly newer than OLD_VERSION
+      if [ "$(printf '%s\n%s' "$OLD_VERSION" "$m_ver" | sort -V | head -1)" = "$OLD_VERSION" ] \
+         && [ "$OLD_VERSION" != "$m_ver" ]; then
+        say "Migration $m_ver…"
+        run "bash '$migration'" || warn "migration $m_ver had errors (non-fatal)"
+      fi
+    done
+  fi
+
+  # ---- post-upgrade markers (mirrors gstack-upgrade Step 5) ----
+  if [ "$DRY_RUN" != 1 ]; then
+    mkdir -p "$HOME/.gstack"
+    echo "$OLD_VERSION" > "$HOME/.gstack/just-upgraded-from"
+    rm -f "$HOME/.gstack/last-update-check" "$HOME/.gstack/update-snoozed"
+  fi
+fi
+
+# ---- rebase the customization branch onto the fresh mirror -----------------
+if git show-ref --verify --quiet "refs/heads/$CUSTOM_BRANCH"; then
+  CUSTOM_AHEAD="$(git rev-list --count "$TRACK_BRANCH..$CUSTOM_BRANCH")"
+  if [ "$CUSTOM_AHEAD" = 0 ]; then
+    say "$CUSTOM_BRANCH has no commits beyond $TRACK_BRANCH — fast-forwarding."
+    run "git checkout --quiet $CUSTOM_BRANCH"
+    run "git merge --ff-only $TRACK_BRANCH" || warn "could not fast-forward $CUSTOM_BRANCH"
+  else
+    say "Rebasing $CUSTOM_BRANCH ($CUSTOM_AHEAD commit(s)) onto $TRACK_BRANCH…"
+    git --no-pager log --oneline "$TRACK_BRANCH..$CUSTOM_BRANCH" | sed 's/^/    /'
+    run "git checkout --quiet $CUSTOM_BRANCH"
+    if [ "$DRY_RUN" = 1 ]; then
+      echo "  [dry-run] git rebase $TRACK_BRANCH"
+    elif git rebase "$TRACK_BRANCH"; then
+      ok "Rebase clean."
+    else
+      git rebase --abort
+      restore_stash
+      die "Rebase hit conflicts and was ABORTED — $CUSTOM_BRANCH is untouched.
+   Resolve manually:  cd $INSTALL_DIR && git checkout $CUSTOM_BRANCH && git rebase $TRACK_BRANCH"
+    fi
+  fi
+else
+  warn "customization branch '$CUSTOM_BRANCH' does not exist — skipping rebase"
+fi
+
+# ---- return to where we started + restore stash ----------------------------
+TARGET_BRANCH="$CUSTOM_BRANCH"
+git show-ref --verify --quiet "refs/heads/$CUSTOM_BRANCH" || TARGET_BRANCH="$ORIG_BRANCH"
+run "git checkout --quiet $TARGET_BRANCH"
+restore_stash
+
+NEW_VERSION="$(cat VERSION 2>/dev/null || echo unknown)"
+echo
+if [ "$OLD_VERSION" = "$NEW_VERSION" ]; then
+  ok "Done — still on v$NEW_VERSION (no upstream change). Now on '$(git rev-parse --abbrev-ref HEAD)'."
+else
+  ok "Done — upgraded v$OLD_VERSION → v$NEW_VERSION. Now on '$(git rev-parse --abbrev-ref HEAD)'."
+fi
+[ "$STASHED" = 1 ] && warn "Auto-stash was popped — double-check your working tree."
+echo "Tip: review What's New in $INSTALL_DIR/CHANGELOG.md"
