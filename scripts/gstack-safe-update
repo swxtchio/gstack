@@ -158,7 +158,9 @@ STASHED=0
 if ! git diff --quiet || ! git diff --cached --quiet; then
   warn "Working tree is dirty — stashing before update."
   run "git stash push -u -m 'gstack-safe-update auto-stash'"
-  STASHED=1
+  # only mark stashed when we actually stashed — in --dry-run the push above is
+  # a no-op, so restore_stash must NOT run a real `git stash pop` (would mutate).
+  if [ "$DRY_RUN" != 1 ]; then STASHED=1; fi
 fi
 
 restore_stash() {
@@ -168,14 +170,50 @@ restore_stash() {
   fi
 }
 
-# ---- update the mirror branch ----------------------------------------------
+# ---- update the mirror branch (fast-forward only; never dirtied) -----------
+# NOTE: ./setup + migrations deliberately run AFTER the rebase, on the custom
+# branch (see below). Running them here would rewrite tracked files and leave
+# the mirror working tree dirty, which then aborts `git checkout $CUSTOM_BRANCH`
+# ("local changes would be overwritten"). Keep the mirror pristine.
 if [ "$BEHIND" != 0 ]; then
   say "Updating $TRACK_BRANCH → $UPSTREAM…"
   run "git checkout --quiet $TRACK_BRANCH"
   run "git merge --ff-only $UPSTREAM"   # safe: we proved AHEAD=0, so FF always works
   ok "$TRACK_BRANCH now at $(git rev-parse --short "$UPSTREAM")"
+fi
 
-  # ---- ./setup ----
+# ---- rebase the customization branch onto the fresh mirror -----------------
+if git show-ref --verify --quiet "refs/heads/$CUSTOM_BRANCH"; then
+  CUSTOM_AHEAD="$(git rev-list --count "$TRACK_BRANCH..$CUSTOM_BRANCH")"
+  if [ "$CUSTOM_AHEAD" = 0 ]; then
+    say "$CUSTOM_BRANCH has no commits beyond $TRACK_BRANCH — fast-forwarding."
+    run "git checkout --quiet $CUSTOM_BRANCH"
+    run "git merge --ff-only $TRACK_BRANCH" || warn "could not fast-forward $CUSTOM_BRANCH"
+  else
+    say "Rebasing $CUSTOM_BRANCH ($CUSTOM_AHEAD commit(s)) onto $TRACK_BRANCH…"
+    git --no-pager log --oneline "$TRACK_BRANCH..$CUSTOM_BRANCH" | sed 's/^/    /'
+    run "git checkout --quiet $CUSTOM_BRANCH"
+    if [ "$DRY_RUN" = 1 ]; then
+      echo "  [dry-run] git rebase $TRACK_BRANCH"
+    elif git rebase "$TRACK_BRANCH"; then
+      ok "Rebase clean."
+    else
+      git rebase --abort
+      restore_stash
+      die "Rebase hit conflicts and was ABORTED — $CUSTOM_BRANCH is untouched.
+   Resolve manually:  cd $INSTALL_DIR && git checkout $CUSTOM_BRANCH && git rebase $TRACK_BRANCH"
+    fi
+  fi
+else
+  warn "customization branch '$CUSTOM_BRANCH' does not exist — skipping rebase"
+fi
+
+# ---- build steps: AFTER the rebase, on the custom branch -------------------
+# We are now on $CUSTOM_BRANCH (if it exists). ./setup regenerates tracked files
+# to match the rebased tree, so it must run HERE — running it on the pristine
+# mirror would dirty that branch and break the checkout above. bun/node installs
+# and generated SKILL.md files belong to the branch we actually end up on.
+if [ "$BEHIND" != 0 ]; then
   if [ -x ./setup ]; then
     say "Running ./setup…"
     run "./setup"
@@ -203,32 +241,6 @@ if [ "$BEHIND" != 0 ]; then
     echo "$OLD_VERSION" > "$HOME/.gstack/just-upgraded-from"
     rm -f "$HOME/.gstack/last-update-check" "$HOME/.gstack/update-snoozed"
   fi
-fi
-
-# ---- rebase the customization branch onto the fresh mirror -----------------
-if git show-ref --verify --quiet "refs/heads/$CUSTOM_BRANCH"; then
-  CUSTOM_AHEAD="$(git rev-list --count "$TRACK_BRANCH..$CUSTOM_BRANCH")"
-  if [ "$CUSTOM_AHEAD" = 0 ]; then
-    say "$CUSTOM_BRANCH has no commits beyond $TRACK_BRANCH — fast-forwarding."
-    run "git checkout --quiet $CUSTOM_BRANCH"
-    run "git merge --ff-only $TRACK_BRANCH" || warn "could not fast-forward $CUSTOM_BRANCH"
-  else
-    say "Rebasing $CUSTOM_BRANCH ($CUSTOM_AHEAD commit(s)) onto $TRACK_BRANCH…"
-    git --no-pager log --oneline "$TRACK_BRANCH..$CUSTOM_BRANCH" | sed 's/^/    /'
-    run "git checkout --quiet $CUSTOM_BRANCH"
-    if [ "$DRY_RUN" = 1 ]; then
-      echo "  [dry-run] git rebase $TRACK_BRANCH"
-    elif git rebase "$TRACK_BRANCH"; then
-      ok "Rebase clean."
-    else
-      git rebase --abort
-      restore_stash
-      die "Rebase hit conflicts and was ABORTED — $CUSTOM_BRANCH is untouched.
-   Resolve manually:  cd $INSTALL_DIR && git checkout $CUSTOM_BRANCH && git rebase $TRACK_BRANCH"
-    fi
-  fi
-else
-  warn "customization branch '$CUSTOM_BRANCH' does not exist — skipping rebase"
 fi
 
 # ---- return to where we started + restore stash ----------------------------
