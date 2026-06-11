@@ -55,12 +55,16 @@ _gstack_codex_timeout_wrapper() {
   # Resolve wrapper binary: prefer gtimeout (Homebrew coreutils on macOS),
   # fall back to timeout (Linux), else run unwrapped. Arguments: $1 is the
   # duration in seconds; rest is the command to run.
+  #
+  # --kill-after=10: timeout sends SIGTERM at $_duration, then SIGKILL 10s later
+  # if the child is still alive. A plain `timeout $_duration` can't reap a child
+  # that traps/ignores SIGTERM; the escalation guarantees the wrapper fires.
   local _duration="$1"
   shift
   local _to
   _to=$(command -v gtimeout 2>/dev/null || command -v timeout 2>/dev/null || echo "")
   if [ -n "$_to" ]; then
-    "$_to" "$_duration" "$@"
+    "$_to" --kill-after=10 "$_duration" "$@"
   else
     "$@"
   fi
