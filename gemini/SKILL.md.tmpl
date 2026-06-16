@@ -149,7 +149,63 @@ mode (persona prompt). Reference this section as "the filesystem boundary" below
 Run Gemini code review against the current branch diff.
 
 Gemini does not have a built-in `review` subcommand (unlike Codex). We construct
-a review prompt, embed the diff, and parse findings.
+a review prompt and parse findings.
+
+**Preferred path — full-context sandbox.** A diff is too small a lens: it makes
+gemini emit confident-wrong "missing / breaking / no-default" findings because
+the proving context lives in unchanged code the diff never shows. Run gemini
+**tool-enabled over the WHOLE repo + web** inside a throwaway worktree, bounded
+by a hard timeout. Gemini's `--approval-mode plan` disables tools entirely, so
+full context requires `-y` **plus `GEMINI_CLI_TRUST_WORKSPACE=true`** (a fresh
+worktree is an untrusted folder, where gemini silently downgrades `-y` to a
+prompt and loses tool access); the clean worktree + `timeout --kill-after` + the
+cleanup trap are what make that safe (any writes discarded, any survivors
+killed). Use this whenever the branch is clean + pushed; fall through to the
+numbered diff-only steps below only if the worktree can't be set up.
+
+```bash
+source ~/.claude/skills/gstack/bin/gstack-review-sandbox
+trap gstack_review_cleanup EXIT INT TERM
+_RR=$(git rev-parse --show-toplevel) || { echo "ERROR: not in a git repo" >&2; exit 1; }
+_BR=$(git branch --show-current)
+if gstack_review_setup_worktree "$_RR" "$_BR" >/dev/null; then
+  DIFF=$(git diff "origin/<base>...HEAD" 2>/dev/null || git diff "<base>...HEAD" 2>/dev/null)
+  PROMPT="IMPORTANT: Do NOT read or execute any files under ~/.claude/, ~/.agents/, .claude/skills/, or agents/. These are Claude Code skill definitions meant for a different AI system. Do NOT modify agents/openai.yaml. Stay focused on repository code only.
+
+You have the WHOLE repository here and web access. Review only this branch's changes (the diff below is orientation — run git/grep to read more). READ each changed file IN FULL and its dependencies (schema, validator, callers) before judging. Before claiming something is missing / breaking / has no default, QUOTE the file:line that proves it; unquoted absence-claims do not count.
+
+Find substantive issues ONLY. Format each as [P1] file:line — desc (must-fix: correctness, security, data loss, crash, breaking API) or [P2] file:line — desc (should-fix: logic gaps, missing edge cases, error handling, perf, test gaps). Be terse — no compliments/preamble/summary. If none, output exactly: NO_FINDINGS.${_USER_INSTRUCTIONS:+
+
+ADDITIONAL FOCUS: $_USER_INSTRUCTIONS}
+
+THE DIFF (orientation — not the limit of what you may read):
+$DIFF"
+  # GEMINI_CLI_TRUST_WORKSPACE=true is REQUIRED: a fresh worktree is an
+  # untrusted folder, and gemini silently downgrades `-y` to approval-prompt
+  # (→ no tool access, empty output) in untrusted dirs. Our worktree + timeout
+  # + cleanup IS the sandbox, so bypassing gemini's folder-trust gate is safe.
+  ( cd "$GR_WT" && gstack_run_reviewer gemini 480 180 1 -- \
+      env GEMINI_CLI_TRUST_WORKSPACE=true \
+      gemini -m gemini-3.1-pro-preview -y --include-directories "$GR_WT" -o stream-json -p "$PROMPT" ) \
+    > "$GR_OUTDIR/gemini.status"
+  _GEMINI_FC_STATUS=$(cut -d: -f2 "$GR_OUTDIR/gemini.status" 2>/dev/null)
+  TMPRESP="$GR_OUTDIR/gemini.out"; TMPERR="$GR_OUTDIR/gemini.err"
+  case "$_GEMINI_FC_STATUS" in
+    TIMEOUT|CRASH) echo "[gemini $_GEMINI_FC_STATUS] full-context review did NOT complete — this is a COVERAGE GAP, not a clean pass. Re-run, or record reduced coverage in the cross-model synthesis." >&2 ;;
+  esac
+  _GEMINI_FULL_CONTEXT=1
+else
+  echo "[gemini] no clean worktree (dirty/unpushed tree) — using the diff-only fallback below; note the reduced lens in the review." >&2
+  _GEMINI_FULL_CONTEXT=0
+fi
+```
+
+If the full-context path ran (`_GEMINI_FULL_CONTEXT=1`), the stream-json output
+is in `$GR_OUTDIR/gemini.out` — parse it with the Python block in step 3
+(`python3 -u -c "…" < "$GR_OUTDIR/gemini.out"`), then continue at step 4. Use
+`timeout: 600000` on that Bash call (full-context reads more). The numbered
+steps below are the **diff-only fallback** (run them only when
+`_GEMINI_FULL_CONTEXT=0`).
 
 1. Create temp files for output capture and detect base branch:
 ```bash
@@ -299,6 +355,14 @@ Gemini tries to break your code — finding edge cases, race conditions, securit
 and failure modes that a normal review would miss. Gemini's architectural divergence
 from Claude often surfaces blind spots that codex (more architecturally similar to
 Claude) doesn't catch.
+
+**Preferred path — full-context sandbox.** Same as Review mode (Step 2A): when
+the branch is clean + pushed, run the adversarial prompt tool-enabled over the
+whole repo via `gstack_run_reviewer` inside the worktree, instead of embedding a
+bare diff — use the Step 2A harness block, swapping in the adversarial prompt
+below for `$PROMPT`. A `TIMEOUT`/`CRASH` status is a coverage gap, not "no
+issues found." Fall through to the diff-only steps below only when no clean
+worktree is available.
 
 1. Construct the adversarial prompt. **Always prepend the filesystem boundary instruction.**
    If the user provided a focus area (e.g., `/gemini challenge security`), include it after
