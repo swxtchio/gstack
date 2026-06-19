@@ -965,6 +965,17 @@ mode (persona prompt). Reference this section as "the filesystem boundary" below
 
 Run Codex code review against the current branch diff.
 
+**Note — full-context is already Codex's strength.** Unlike gemini, `codex exec`
+/`codex review` run in a real read-only-but-tool-enabled sandbox (`-s read-only`),
+so Codex already reads the whole repo + web, not just the diff. For
+timeout-robust, clean-snapshot review (review a clean+pushed worktree instead of
+a dirty working tree, with a hard timeout + stall watchdog + auto-cleanup), wrap
+the invocation in the shared harness — see `~/.claude/skills/gstack/bin/gstack-review-sandbox`
+and the orchestrator example in the fix-and-ship skill:
+`gstack_run_reviewer codex 480 180 1 -- codex exec "$PROMPT" -C "$GR_WT" -s read-only …`.
+The default path below is the standalone (non-orchestrated) invocation; it keeps
+its own `_gstack_codex_timeout_wrapper`.
+
 1. Create temp files for output capture:
 ```bash
 TMPERR=$(mktemp "$TMP_ROOT/codex-err-XXXXXX.txt")

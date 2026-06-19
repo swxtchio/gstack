@@ -98,6 +98,11 @@
       "routing": "Blocks Edit and\nWrite outside the allowed path. Use when debugging to prevent accidentally\n\"fixing\" unrelated code, or when you want to scope changes to one module.\nUse when asked to \"freeze\", \"restrict edits\", \"only edit this folder\",\nor \"lock down edits\".",
       "voice_line": null
     },
+    "gemini": {
+      "lead": "Google Gemini CLI wrapper — three modes mirroring /codex.",
+      "routing": "Code review: independent diff review with pass/fail gate.\nChallenge: adversarial mode that tries to break your code.\nConsult: ask gemini anything with session continuity for follow-ups.\nArchitecturally divergent from Claude (different training paradigm), so\nagreement = stronger signal and disagreement = better blind-spot coverage.\nUse when asked to \"gemini review\", \"gemini challenge\", \"ask gemini\",\n\"second opinion\", or \"consult gemini\".",
+      "voice_line": "Voice triggers (speech-to-text aliases): \"ask gemini\", \"google second opinion\", \"gem in eye\"."
+    },
     "gstack": {
       "lead": "Router for the gstack skill suite.",
       "routing": "Sends any gstack request to the right skill\n(planning, review, QA, shipping, debugging, docs, security, design). For browser/QA\nand dogfooding it points you at /browse. Use when you invoke gstack without a specific\nskill, or ask \"which gstack skill fits this?\".",
