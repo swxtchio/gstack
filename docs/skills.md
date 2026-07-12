@@ -43,6 +43,7 @@ Detailed guides for every gstack skill — philosophy, workflow, and examples.
 | | | |
 | **Multi-AI** | | |
 | [`/codex`](#codex) | **Second Opinion** | Independent review from OpenAI Codex CLI. Three modes: code review (pass/fail gate), adversarial challenge, and open consultation with session continuity. Cross-model analysis when both `/review` and `/codex` have run. |
+| [`/gemini`](#gemini) | **Second Opinion** | Independent review from Google Gemini CLI. Three modes mirroring `/codex`: code review (pass/fail gate), adversarial challenge, and open consultation with session continuity. Architecturally divergent from Claude, so agreement is a stronger signal and disagreement gives better blind-spot coverage. |
 | [`/pair-agent`](#pair-agent) | **Remote Agent Bridge** | Pair a remote AI agent (OpenClaw, Codex, Cursor, Hermes) with your browser. Scoped tunnel, locked allowlist, session token. |
 | [`/setup-gbrain`](#setup-gbrain) | **Memory Sync** | Set up gbrain for cross-machine session memory sync. One command from zero to live. |
 | [`/sync-gbrain`](#sync-gbrain) | **Keep Brain Current** | Refresh gbrain against this repo's code; teach the agent when to use `gbrain search`/`code-def` over Grep. Idempotent; safe to re-run. |
@@ -1053,6 +1054,26 @@ Claude: Running independent Codex review...
         UNIQUE TO CODEX: Token comparison timing attack
         UNIQUE TO CLAUDE: N+1 query in listing photos
 ```
+
+---
+
+## `/gemini`
+
+This is my other **second opinion mode**, mirroring `/codex` but backed by Google's Gemini CLI.
+
+Gemini is architecturally divergent from Claude (different training paradigm), so its agreement is a stronger signal and its disagreement gives better blind-spot coverage. Where `/codex` brings OpenAI's perspective, `/gemini` brings Google's — run either (or both) when you want a cross-model read on the same diff.
+
+### Three modes
+
+**Review** — run an independent Gemini review of the current diff. Gemini reads every changed file, classifies findings by severity, and returns a PASS/FAIL verdict. Fully independent — Gemini doesn't see Claude's review.
+
+**Challenge** — adversarial mode. Gemini actively tries to break your code: edge cases, race conditions, security holes, and load-bearing assumptions.
+
+**Consult** — open conversation with session continuity. Ask Gemini anything about the codebase; follow-up questions reuse the same session so context carries over.
+
+### Cross-model analysis
+
+Same "two doctors, same patient" approach as `/codex`: when Claude and Gemini both review the same branch, the overlap is high-confidence, and the unique findings from each are where you catch bugs neither would find alone.
 
 ---
 
