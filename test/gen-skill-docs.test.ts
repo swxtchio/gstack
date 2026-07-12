@@ -1689,7 +1689,7 @@ describe('Codex generation (--host codex)', () => {
     }
     for (const entry of fs.readdirSync(ROOT, { withFileTypes: true })) {
       if (!entry.isDirectory() || entry.name.startsWith('.') || entry.name === 'node_modules') continue;
-      if (entry.name === 'codex') continue; // /codex is excluded from Codex output
+      if (entry.name === 'codex' || entry.name === 'gemini') continue; // second-opinion CLI wrappers excluded from Codex output (hosts/codex.ts skipSkills)
       if (!fs.existsSync(path.join(ROOT, entry.name, 'SKILL.md.tmpl'))) continue;
       const codexName = entry.name.startsWith('gstack-') ? entry.name : `gstack-${entry.name}`;
       if (isSymlinkLoop(codexName)) continue;
@@ -2008,7 +2008,7 @@ describe('Factory generation (--host factory)', () => {
     }
     for (const entry of fs.readdirSync(ROOT, { withFileTypes: true })) {
       if (!entry.isDirectory() || entry.name.startsWith('.') || entry.name === 'node_modules') continue;
-      if (entry.name === 'codex') continue;
+      if (entry.name === 'codex' || entry.name === 'gemini') continue; // second-opinion CLI wrappers excluded (hosts/factory.ts skipSkills)
       if (!fs.existsSync(path.join(ROOT, entry.name, 'SKILL.md.tmpl'))) continue;
       const factoryName = entry.name.startsWith('gstack-') ? entry.name : `gstack-${entry.name}`;
       if (isSymlinkLoop(factoryName)) continue;

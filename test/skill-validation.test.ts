@@ -1693,6 +1693,7 @@ describe('Codex skill validation', () => {
     for (const entry of fs.readdirSync(ROOT, { withFileTypes: true })) {
       if (!entry.isDirectory() || entry.name.startsWith('.') || entry.name === 'node_modules') continue;
       if (entry.name === 'codex') continue; // Claude-only skill
+      if (entry.name === 'gemini') continue; // Claude-only skill (second-opinion CLI wrapper)
       if (entry.name === 'claude') continue; // External-host-only skill
       if (fs.existsSync(path.join(ROOT, entry.name, 'SKILL.md.tmpl'))) {
         skills.push(entry.name);
@@ -1701,7 +1702,7 @@ describe('Codex skill validation', () => {
     return skills;
   })();
 
-  test('all skills (except /codex) have both Claude and Codex variants', () => {
+  test('all skills (except /codex and /gemini) have both Claude and Codex variants', () => {
     for (const skillDir of CLAUDE_SKILLS_WITH_TEMPLATES) {
       // Claude variant
       const claudeMd = path.join(ROOT, skillDir, 'SKILL.md');
@@ -1722,6 +1723,13 @@ describe('Codex skill validation', () => {
     expect(fs.existsSync(path.join(ROOT, 'codex', 'SKILL.md'))).toBe(true);
     // Codex variant must NOT exist
     expect(fs.existsSync(path.join(AGENTS_DIR, 'gstack-codex', 'SKILL.md'))).toBe(false);
+  });
+
+  test('/gemini skill is Claude-only — no Codex variant', () => {
+    // Claude variant should exist
+    expect(fs.existsSync(path.join(ROOT, 'gemini', 'SKILL.md'))).toBe(true);
+    // Codex variant must NOT exist (second-opinion CLI wrapper, Claude-host-only)
+    expect(fs.existsSync(path.join(AGENTS_DIR, 'gstack-gemini', 'SKILL.md'))).toBe(false);
   });
 
   test('/claude skill is external-host-only — no Claude-host variant', () => {
