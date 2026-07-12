@@ -274,8 +274,13 @@ describe('gstack-codex-probe: timeout wrapper + namespace hygiene', () => {
     // Create a stub gtimeout that prints a sentinel so we can verify it was chosen.
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-gto-stub-'));
     try {
+      // Stub behaves like real gtimeout: it accepts leading options
+      // (e.g. --kill-after=N, the SIGKILL-escalation flag the wrapper passes)
+      // BEFORE the duration argument. Skip any leading -flags, then echo the
+      // duration so the assertion verifies gtimeout was chosen with the right
+      // timeout regardless of which hardening flags precede it.
       const stub = path.join(dir, 'gtimeout');
-      fs.writeFileSync(stub, '#!/bin/bash\necho gtimeout_chosen_$1\n');
+      fs.writeFileSync(stub, '#!/bin/bash\nwhile [[ "$1" == -* ]]; do shift; done\necho gtimeout_chosen_$1\n');
       fs.chmodSync(stub, 0o755);
       const r = runProbe({
         snippet: `_gstack_codex_timeout_wrapper 5 echo nope`,
